@@ -37,4 +37,4 @@ python main.py
 
 - `main.py` : точка входа
 - `steam.py` : поиск пути Steam (реестр и стандартные пути), название игры по AppID
-- `monitor.py` : чтение `content_log.txt`, парсинг, отчёты
+- `monitor.py` : чтение `content_log.txt`, парсинг, отчёты, настройки мониторинга
