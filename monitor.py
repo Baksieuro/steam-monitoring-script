@@ -16,7 +16,7 @@ from datetime import datetime
 from steam import get_app_name, get_log_path
 
 TAIL_BYTES = 2 * 1024 * 1024
-REPORT_INTERVAL_SEC = 60.0
+REPORT_INTERVAL_SEC = 60
 NUM_REPORTS = 5
 TAIL_BEFORE_REPORT_BYTES = 512 * 1024
 
@@ -29,6 +29,7 @@ RE_DOWNLOAD_STARTED = re.compile(
 )
 RE_STATE = re.compile(r"AppID\s+(\d+)\s+state changed\s*:\s*(.+)", re.IGNORECASE)
 RE_APP_UPDATE_CHANGED = re.compile(r"AppID\s+(\d+)\s+App update changed\s*:\s*(.+)", re.IGNORECASE)
+RE_UPDATE_CANCELED = re.compile(r"AppID\s+(\d+)\s+update canceled\s*:\s*(.+)", re.IGNORECASE)
 RE_CURRENT_RATE = re.compile(r"Current download rate:\s*([\d.]+)\s*Mbps", re.IGNORECASE)
 RE_FULLY_INSTALLED = re.compile(r"AppID\s+(\d+)\s+.*Fully Installed", re.IGNORECASE)
 RE_FINISHED_UPDATE = re.compile(r"AppID\s+(\d+)\s+finished update", re.IGNORECASE)
@@ -68,6 +69,7 @@ def _read_from(log_path: str, from_pos: int) -> tuple[str, int]:
 def _parse_chunk(text: str) -> tuple[dict[int, dict[str, bool | int]], float | None]:
     """
     Парсит фрагмент лога Steam.
+    Обрабатывает строки в обратном порядке (от новых к старым), чтобы последние записи имели приоритет.
     Возвращает: (словарь app_id -> состояние, последняя ненулевая скорость Mbps или None).
     """
     out = {}
@@ -86,7 +88,7 @@ def _parse_chunk(text: str) -> tuple[dict[int, dict[str, bool | int]], float | N
                 last_nonzero_speed_mbps = speed_val
             continue
 
-        # Завершённые загрузки: "Fully Installed" или "finished update"
+        # Завершённые загрузки из лога: "Fully Installed" или "finished update"
         mf = RE_FULLY_INSTALLED.search(rest) or RE_FINISHED_UPDATE.search(rest)
         if mf:
             app_id = int(mf.group(1))
@@ -108,6 +110,17 @@ def _parse_chunk(text: str) -> tuple[dict[int, dict[str, bool | int]], float | N
         if matched_dl:
             continue
 
+        mc = RE_UPDATE_CANCELED.search(rest)
+        if mc:
+            app_id = int(mc.group(1))
+            cancel_str = mc.group(2)
+            if app_id not in out:
+                out[app_id] = _empty_app()
+            if "suspended" in cancel_str.lower():
+                out[app_id]["paused"] = True
+                out[app_id]["downloading"] = False
+            continue
+
         for re_st in (RE_STATE, RE_APP_UPDATE_CHANGED):
             ms = re_st.search(rest)
             if ms:
@@ -115,19 +128,35 @@ def _parse_chunk(text: str) -> tuple[dict[int, dict[str, bool | int]], float | N
                 state_str = ms.group(2)
                 if app_id not in out:
                     out[app_id] = _empty_app()
-                paused = "suspended" in state_str.lower()
-                downloading = "Downloading" in state_str and not paused
-                # eсли "Fully Installed" в статусе (как в логе стима), то загрузка завершена
-                if "Fully Installed" in state_str:
-                    downloading = False
-                    paused = False
-                out[app_id].update(paused=paused, downloading=downloading)
+                # Определяем статусы только если они явно указаны в строке
+                has_suspended = "suspended" in state_str.lower()
+                has_downloading = "Downloading" in state_str
+                has_fully_installed = "Fully Installed" in state_str
+                
+                # Приоритет: Downloading -> Suspended (т.к. активная загрузка важнее паузы)
+                # Если есть Downloading, устанавливаем downloading=True и снимаем паузу
+                if has_downloading and not has_suspended:
+                    out[app_id]["downloading"] = True
+                    out[app_id]["paused"] = False
+                # Если есть Suspended, устанавливаем паузу (но только если нет активной загрузки)
+                elif has_suspended:
+                    out[app_id]["paused"] = True
+                    out[app_id]["downloading"] = False
+                # Если Fully Installed, загрузка завершена
+                elif has_fully_installed:
+                    out[app_id]["paused"] = False
+                    out[app_id]["downloading"] = False
+                # Если нет явного указания, старые значения сохраняются (не перезаписываем)
                 break
     # Предпочитаем ненулевую скорость (активная загрузка), иначе последнюю (может быть 0)
     return out, last_nonzero_speed_mbps if last_nonzero_speed_mbps is not None else last_speed_mbps
 
 
 def _merge(state: dict, parsed: dict):
+    """
+    Объединяет новый парсинг с текущим состоянием.
+    update() обновляет только переданные ключи, старые значения сохраняются если ключ не передан.
+    """
     for app_id, info in parsed.items():
         if app_id not in state:
             state[app_id] = _empty_app()
@@ -139,19 +168,31 @@ def _build_report(steam_path: str, state: dict, current_speed_mbps: float | None
     Формирует отчёт: игры в загрузке или на паузе.
     Показывает: название, статус (Загрузка/Пауза), скорость из лога Steam.
     """
-    # Только активные загрузки (Downloading) или на паузе (Suspended)
-    relevant = {
-        aid: info for aid, info in state.items()
-        if (info.get("downloading") and not info.get("paused")) or info.get("paused")
-    }
+    # Собираем только интересующие приложения: в загрузке или на паузе
+    relevant = {}
+    has_downloading = False
+    for aid, info in state.items():
+        is_downloading = bool(info.get("downloading") and not info.get("paused"))
+        is_paused = bool(info.get("paused"))
+        if is_downloading or is_paused:
+            relevant[aid] = info
+            if is_downloading:
+                has_downloading = True
+
+    # Ничего не качается и ничего не на паузе
     if not relevant:
         return "Активных загрузок нет.\n"
+
     lines = []
+    # Если нет ни одной активной загрузки (только паузы), то явно пишем об этом
+    if not has_downloading:
+        lines.append("Активных загрузок нет.")
 
     if current_speed_mbps is not None and current_speed_mbps > 0:
         speed_str = f"{current_speed_mbps:.2f} МБит/сек."
     else:
         speed_str = "-"
+
     for app_id in sorted(relevant.keys()):
         info = relevant[app_id]
         name = get_app_name(steam_path, app_id)
@@ -163,7 +204,7 @@ def _build_report(steam_path: str, state: dict, current_speed_mbps: float | None
 
 
 class SteamDownloadMonitor:
-    """Мониторинг загрузок Steam: читает content_log.txt, выводит отчёты каждую минуту (по заданию)."""
+    """Мониторинг загрузок Steam: читает content_log.txt, выводит отчёты по заданному интервалу."""
 
     def __init__(self, steam_path: str):
         self.steam_path = steam_path
@@ -183,9 +224,8 @@ class SteamDownloadMonitor:
 
     def _tick(self) -> tuple[datetime, str]:
         """
-        Один цикл мониторинга: ждём REPORT_INTERVAL_SEC, читаем новые строки лога, формируем отчёт.
+        Один цикл мониторинга: читаем новые строки лога, формируем отчёт.
         """
-        time.sleep(REPORT_INTERVAL_SEC)
         now = datetime.now()
         # Читаем новые строки с последней позиции
         text, self.read_pos = _read_from(self.log_path, self.read_pos)
@@ -204,17 +244,21 @@ class SteamDownloadMonitor:
         return now, _build_report(self.steam_path, self.state, self.current_speed_mbps)
 
     def run(self, num_reports: int = NUM_REPORTS) -> None:
-        """Запуск мониторинга: num_reports отчётов каждую минуту."""
+        """Запуск мониторинга: num_reports отчётов по заданному интервалу."""
         if not os.path.isfile(self.log_path):
             print(f"Файл лога не найден: {self.log_path}")
-            print("Запустите Steam и начните загрузку игры.")
+            print("Запустите Steam и начните загрузку игры.")   
             return
         print("Путь к Steam:", self.steam_path)
         print("Лог:", self.log_path)
-        print(f"Мониторинг: {num_reports} отчётов с интервалом 1 минута.\n")
+        print(f"Мониторинг: {num_reports} отчётов с интервалом {REPORT_INTERVAL_SEC} секунд.\n")
 
         self._load_initial()
+
         for i in range(num_reports):
+            # Первый отчёт пишем сразу, последующие с интервалом REPORT_INTERVAL_SEC
+            if i > 0:
+                time.sleep(REPORT_INTERVAL_SEC)
             now, report = self._tick()
             print(f"--- Отчёт {i + 1}/{num_reports} | {now.strftime('%H:%M:%S')} ---")
             print(report)

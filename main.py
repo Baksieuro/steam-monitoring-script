@@ -1,4 +1,4 @@
-"""Точка входа: мониторинг загрузок Steam (мониторинг загрузок каждую минуту)."""
+"""Точка входа: мониторинг загрузок Steam (мониторинг загрузок по заданному интервалу)."""
 
 from steam import get_steam_path
 from monitor import SteamDownloadMonitor
